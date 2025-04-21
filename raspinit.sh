@@ -4,59 +4,71 @@ set -e
 ADGUARD_DIR="/opt/adguardhome"
 COMPOSE_FILE="$ADGUARD_DIR/docker-compose.yml"
 DDCLIENT_CONFIG="/etc/ddclient.conf"
+KEYRING_DIR="/etc/apt/keyrings"
 
 # Ensure root
 if [[ "$EUID" -ne 0 ]]; then
-  echo "Run as root (sudo)."
+  echo "Run this script as root (sudo)."
   exit 1
 fi
 
-# Prompt for credentials
-read -p "Enter your Cloudflare Zone (e.g. example.com): " cf_zone
-read -p "Enter the full hostname you want to update (e.g. home.example.com): " cf_hostname
-read -p "Enter your Cloudflare API token (DNS edit permission): " cf_token
-read -p "Enter your Tailscale auth key: " ts_key
-read -p "Enter the network interface (e.g. eth0): " net_iface
+echo "🔄 Starting setup on $(hostname)..."
 
-# Update system
-echo "[+] Updating system..."
-apt update -y && apt upgrade -y
-
-# Install dependencies
-echo "[+] Installing packages..."
-apt install -y \
-  apt-transport-https \
-  ca-certificates \
-  curl \
-  gnupg \
-  lsb-release \
-  software-properties-common \
-  ddclient \
-  jq
-
-# Install Docker
-echo "[+] Installing Docker..."
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
-  | tee /etc/apt/sources.list.d/docker.list > /dev/null
+### 1. System Updates
+echo "📦 Updating package list..."
 apt update -y
-apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-systemctl enable --now docker
 
-# Install & authenticate Tailscale
-echo "[+] Installing Tailscale..."
-curl -fsSL https://tailscale.com/install.sh | sh
-systemctl enable --now tailscaled
-echo "[+] Connecting to Tailscale..."
-tailscale up --authkey "$ts_key" || {
-  echo "[-] Tailscale login failed. Exiting."
-  exit 1
-}
+### 2. Install Docker (skip if already installed)
+if ! command -v docker &>/dev/null; then
+  echo "🐳 Installing Docker..."
 
-# Configure ddclient for Cloudflare
-echo "[+] Configuring ddclient for Cloudflare..."
-cat <<EOF > "$DDCLIENT_CONFIG"
+  install -m 0755 -d $KEYRING_DIR
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o $KEYRING_DIR/docker.gpg
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=$KEYRING_DIR/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt update -y
+  apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  systemctl enable --now docker
+else
+  echo "✅ Docker is already installed."
+fi
+
+### 3. Install Tailscale
+if ! command -v tailscale &>/dev/null; then
+  echo "🧩 Installing Tailscale..."
+  curl -fsSL https://tailscale.com/install.sh | sh
+  systemctl enable --now tailscaled
+else
+  echo "✅ Tailscale is already installed."
+fi
+
+# Check if Tailscale is connected
+if ! tailscale status | grep -q "Logged in as"; then
+  echo "🔑 Tailscale not connected."
+  read -p "Enter your Tailscale auth key: " TAILSCALE_AUTHKEY
+  tailscale up --authkey "$TAILSCALE_AUTHKEY"
+else
+  echo "✅ Tailscale is already connected: $(tailscale status | grep 'Logged in as')"
+fi
+
+### 4. Install and configure ddclient (Cloudflare)
+if ! dpkg -s ddclient &>/dev/null; then
+  echo "🌐 Installing ddclient..."
+  apt install -y ddclient
+fi
+
+if ! grep -q "cloudflare" "$DDCLIENT_CONFIG" 2>/dev/null; then
+  echo "🛠️ Configuring ddclient for Cloudflare..."
+
+  read -p "Enter your Cloudflare zone (e.g. example.com): " cf_zone
+  read -p "Enter the full hostname to update (e.g. home.example.com): " cf_hostname
+  read -p "Enter your Cloudflare API token (with DNS edit permissions): " cf_token
+  read -p "Enter your network interface (e.g. eth0): " net_iface
+
+  cat <<EOF > "$DDCLIENT_CONFIG"
 daemon=300
 ssl=yes
 use=if, if=$net_iface
@@ -68,13 +80,19 @@ password=$cf_token
 $cf_hostname
 EOF
 
-chmod 600 "$DDCLIENT_CONFIG"
-systemctl enable --now ddclient
+  chmod 600 "$DDCLIENT_CONFIG"
+  systemctl enable --now ddclient
+  echo "✅ ddclient configured."
+else
+  echo "✅ ddclient is already configured for Cloudflare."
+fi
 
-# Setup AdGuard Home via Docker Compose
-echo "[+] Deploying AdGuard Home..."
-mkdir -p "$ADGUARD_DIR"
-cat <<EOF > "$COMPOSE_FILE"
+### 5. Set up AdGuard Home via Docker Compose
+if [ ! -f "$COMPOSE_FILE" ]; then
+  echo "📦 Creating AdGuard Home docker-compose file..."
+  mkdir -p "$ADGUARD_DIR"
+
+  cat <<EOF > "$COMPOSE_FILE"
 version: '3'
 services:
   adguardhome:
@@ -90,9 +108,18 @@ services:
       - ${ADGUARD_DIR}/work:/opt/adguardhome/work
       - ${ADGUARD_DIR}/conf:/opt/adguardhome/conf
 EOF
+fi
 
-docker compose -f "$COMPOSE_FILE" up -d
+# Start the container if not already running
+if ! docker ps --format '{{.Names}}' | grep -q "^adguardhome$"; then
+  echo "🚀 Launching AdGuard Home..."
+  docker compose -f "$COMPOSE_FILE" up -d
+else
+  echo "✅ AdGuard Home is already running."
+fi
 
-echo "✅ All done!"
-echo "• Visit http://<your_server_ip>:3000 to finish AdGuard Home setup"
-echo "• Your IP will update automatically via Cloudflare every 5 minutes"
+### 6. Done
+echo ""
+echo "🎉 Setup complete!"
+echo "→ Visit http://<your_server_ip>:3000 to finish AdGuard Home setup"
+echo "→ Tailscale is connected, and ddclient will keep your IP synced to Cloudflare"
